@@ -164,6 +164,15 @@ for (var i = 0; i < 5; i++) { }
 console.log(i);  // 5 — still accessible! With let, this would throw ReferenceError
 ```
 
+### Write plain JavaScript — no TypeScript unless approved
+
+All SuiteScript code is written in **plain JavaScript (ES6/ES2015+)**. Do not use TypeScript. The transpilation step from TS → JS introduces compatibility risks with the SuiteScript runtime, and most dev teams are not experienced with TypeScript. Only use TypeScript if explicitly approved by the dev manager (directive may come from the client or implementation partner).
+
+```
+GOOD:  fp_lib_settings.js      ← Plain JavaScript, runs directly on the platform
+BAD:   fp_lib_settings.ts      ← Requires transpilation, risk of runtime issues
+```
+
 ### Use platform enums — never hardcode string/number literals
 
 When the platform provides enums or constants, always use them instead of raw strings or numbers. This prevents typos, enables IDE autocomplete, and survives platform changes.
@@ -275,6 +284,55 @@ define(['N/record'], function(record) {
     function beforeSubmit(context) { /* ... */ }  // Buried!
     return { beforeSubmit };
 });
+```
+
+### Declare the return value at the top of the function
+
+Establish what you're going to return at the **beginning** of the function. This makes the function's intent clear from line one — anyone reading it immediately knows what's being built. Build it up through the function, then return it at the end.
+
+```javascript
+// GOOD: Return value declared upfront — intent is clear
+function buildTaxPayload(record) {
+    const payload = {
+        transactionId: record.id,
+        lines: [],
+        totalAmount: 0
+    };
+
+    const lineCount = record.getLineCount({ sublistId: 'item' });
+    for (let i = 0; i < lineCount; i++) {
+        const lineData = getLineData(record, i);
+        payload.lines.push(lineData);
+        payload.totalAmount += lineData.amount;
+    }
+
+    return payload;
+}
+```
+
+```javascript
+// GOOD: Even simple functions — declare what you return
+function getTransactionIds(filters) {
+    const ids = [];
+
+    const results = search.create({ /* ... */ }).run();
+    results.each(function(result) {
+        ids.push(result.getValue('internalid'));
+        return true;
+    });
+
+    return ids;
+}
+```
+
+```javascript
+// BAD: Return value appears out of nowhere at the end
+function buildTaxPayload(record) {
+    const lineCount = record.getLineCount({ sublistId: 'item' });
+    // ... 40 lines of processing ...
+    // ... more processing ...
+    return { transactionId: record.id, lines: processedLines, totalAmount: sum };  // Surprise!
+}
 ```
 
 ### Keep functions small — aim for under 30 lines
@@ -391,32 +449,127 @@ Think of it as a funnel — data gets smaller and more processed at each stage:
 
 | Stage | Purpose | Input | Output |
 |-------|---------|-------|--------|
-| `getInputData` | Fetch the full data set | Parameters/searches | Array or search object |
+| `getInputData` | Set up the search or query | Parameters/config | Search object, SuiteQL query, or API call |
 | `map` | Break down, validate, group | One item from input | `context.write({ key, value })` grouped by key |
 | `reduce` | Create/update/delete records | Grouped values per key | `context.write({ key, value })` result per key |
 | `summarize` | Report totals, log errors | All output + error iterators | Final log entry |
 
-### `getInputData` — fetch the work set
+### `getInputData` — return a search or query, don't return data
 
-Return an array of IDs or a search object. Apply limits for safety.
+You don't need to build an array and return it. Just return a **saved search**, **`search.create()` object**, or **SuiteQL query** — the platform handles pagination automatically. Keep it minimal and delegate query construction to a library function.
+
+All search/query logic lives in a **separate lib file** (e.g., `fp_lib_query.js`). The Map/Reduce script just calls the lib.
+
+**Saved Search — platform paginates for you:**
 
 ```javascript
+// ── fp_mr_batch_processor.js ──────────────────────────────
+// getInputData just calls the lib — no search logic here
 function getInputData() {
-    try {
-        const script = runtime.getCurrentScript();
-        const limit = parseInt(script.getParameter({ name: 'custscript_fp_batch_limit' }), 10) || DEFAULT_LIMIT;
+    return fp_lib_query.createTransactionSearch();
+}
+```
 
-        let transactionIds = txnQuery.getTransactionIds({ filterType });
+```javascript
+// ── fp_lib_query.js ───────────────────────────────────────
+// Search construction lives here — testable, reusable
+function createTransactionSearch() {
+    return search.create({
+        type: search.Type.TRANSACTION,
+        filters: [
+            ['type', 'anyof', 'SalesOrd', 'CustInvc'],
+            'AND', ['mainline', 'is', 'T'],
+            'AND', ['custbody_fp_needs_processing', 'is', 'T']
+        ],
+        columns: ['internalid', 'type', 'tranid', 'entity']
+    });
+    // Return the search object — DON'T .run().each() it
+    // NetSuite's Map/Reduce engine iterates the search automatically
+}
+```
 
-        if (limit > 0 && transactionIds.length > limit) {
-            transactionIds = transactionIds.slice(0, limit);
-        }
+**SuiteQL with pagination (`OFFSET`/`FETCH`):**
 
-        return transactionIds;
-    } catch (e) {
-        logError('getInputData', e);
-        return [];  // Return empty — don't crash the job
+When using SuiteQL, the platform does **not** auto-paginate. The lib handles paging with `OFFSET` and `FETCH FIRST N ROWS ONLY`:
+
+```javascript
+// ── fp_mr_sync_records.js ─────────────────────────────────
+function getInputData() {
+    return fp_lib_query.getAllTransactionIds();
+}
+```
+
+```javascript
+// ── fp_lib_query.js ───────────────────────────────────────
+function getAllTransactionIds() {
+    const PAGE_SIZE = 1000;
+    let offset = 0;
+    const allResults = [];
+    let hasMore = true;
+
+    while (hasMore) {
+        const results = query.runSuiteQL({
+            query: `
+                SELECT id, type, tranid
+                FROM transaction
+                WHERE custbody_fp_needs_processing = 'T'
+                  AND type IN ('SalesOrd', 'CustInvc')
+                ORDER BY id
+                OFFSET ${offset} ROWS
+                FETCH FIRST ${PAGE_SIZE} ROWS ONLY
+            `
+        }).asMappedResults();
+
+        allResults.push(...results);
+        hasMore = results.length === PAGE_SIZE;
+        offset += PAGE_SIZE;
     }
+
+    return allResults;
+}
+```
+
+**External API call — also in a lib:**
+
+```javascript
+// ── fp_mr_upsert_tax_codes.js ─────────────────────────────
+function getInputData() {
+    return fp_lib_api_connect.getTaxCodes();
+}
+```
+
+```javascript
+// ── fp_lib_api_connect.js ─────────────────────────────────
+function getTaxCodes() {
+    const response = https.post({ url: endpoint, headers: authHeaders, body: payload });
+    return JSON.parse(response.body);
+}
+```
+
+**What NOT to do:**
+
+```javascript
+// BAD: Search logic inline in the Map/Reduce script — move to a lib file
+function getInputData() {
+    const results = [];
+    search.create({
+        type: 'transaction',
+        filters: [['type', 'anyof', 'SalesOrd']],
+        columns: ['internalid', 'tranid']
+    }).run().each(function(result) {
+        results.push(result);  // Building array manually — unnecessary
+        return true;
+    });
+    return results;  // Just return the search object instead
+}
+```
+
+```javascript
+// BAD: SuiteQL without pagination — misses rows beyond first page
+function getInputData() {
+    return query.runSuiteQL({
+        query: `SELECT id FROM transaction WHERE type = 'SalesOrd'`
+    }).asMappedResults();  // Only gets first 5000 rows!
 }
 ```
 
@@ -699,8 +852,16 @@ function beforeSubmit(context) {
         validateTransaction(context.newRecord);
         calculateTax(context.newRecord);
     } catch (e) {
-        logError('beforeSubmit', e);
-        throw e;  // Re-throw so the platform knows it failed
+        // Log the FULL error with stack trace — this goes to the Execution Log
+        log.error('beforeSubmit', `${e.message}\nStack: ${e.stack || 'No stack trace'}`);
+
+        // Throw a CLEAN, user-friendly message — this is what the user sees on screen
+        // Never throw the raw error — the user gets an ugly stack dump page
+        throw error.create({
+            name: 'FP_TAX_CALC_ERROR',
+            message: 'Tax calculation failed. Please contact support. Details logged.',
+            notifyOff: false
+        });
     }
 }
 
@@ -708,9 +869,26 @@ function afterSubmit(context) {
     try {
         postToExternalApi(context.newRecord);
     } catch (e) {
-        logError('afterSubmit', e);
-        // Don't re-throw in afterSubmit — transaction is already saved
+        // afterSubmit: transaction is already saved — log but don't throw
+        log.error('afterSubmit', `${e.message}\nStack: ${e.stack || 'No stack trace'}`);
     }
+}
+```
+
+```javascript
+// BAD: Raw throw — user sees ugly error page with stack dump
+try {
+    calculateTax(context.newRecord);
+} catch (e) {
+    throw e;  // User sees: "TypeError: Cannot read property 'taxcode' of undefined"
+}
+
+// BAD: Throw without logging stack trace — impossible to debug
+try {
+    calculateTax(context.newRecord);
+} catch (e) {
+    log.error('beforeSubmit', e.message);  // No stack trace logged!
+    throw error.create({ name: 'ERROR', message: 'Something failed' });
 }
 ```
 
@@ -735,12 +913,12 @@ try {
 ```
 
 ```javascript
-// GOOD: Always log or handle
+// GOOD: Always log with stack trace
 try {
     processLine(record, i);
 } catch (e) {
-    logError('processLine', e);
-    throw e;
+    log.error('processLine', `${e.message}\nStack: ${e.stack || 'No stack trace'}`);
+    throw e;  // OK to re-throw raw here — this is a helper, not an entry point
 }
 
 // GOOD: If you genuinely want to continue, log WHY you're ignoring it
@@ -816,9 +994,15 @@ function beforeSubmit(context) {
     try {
         calculateTax(context.newRecord);
     } catch (e) {
-        // Error message: "Line 3 "Widget-A" (taxcode: AVATAX): Connection timeout"
-        logError('beforeSubmit', e);
-        throw e;
+        // Log the full error with stack — "Line 3 "Widget-A" (taxcode: AVATAX): Connection timeout"
+        log.error('beforeSubmit', `${e.message}\nStack: ${e.stack || 'No stack trace'}`);
+
+        // Throw clean message for the user
+        throw error.create({
+            name: 'FP_TAX_CALC_ERROR',
+            message: 'Tax calculation failed. Please contact support. Details logged.',
+            notifyOff: false
+        });
     }
 }
 ```
@@ -832,15 +1016,29 @@ Not just:
 [ERROR] Connection timeout
 ```
 
-### Use a consistent `logError` helper
+### Use a consistent `logError` helper — always include stack trace
+
+The stack trace is the most important debugging tool you have. **Never log an error without it.** Without a stack trace, all you get is a message like "Cannot read property 'x' of undefined" with no idea which file or line caused it.
 
 ```javascript
-function logError(context, error) {
+function logError(context, err) {
     log.error(context, [
-        `Message: ${error.message || 'Unknown error'}`,
-        `Stack: ${error.stack || 'No stack trace'}`
+        `Message: ${err.message || 'Unknown error'}`,
+        `Name: ${err.name || 'Error'}`,
+        `Stack: ${err.stack || 'No stack trace available'}`
     ].join('\n'));
 }
+```
+
+```javascript
+// BAD: No stack trace — you'll never find the source
+log.error('beforeSubmit', e.message);
+
+// BAD: Just the error object — NetSuite may serialize it poorly
+log.error('beforeSubmit', e);
+
+// GOOD: Explicit stack trace in the log
+log.error('beforeSubmit', `${e.message}\nStack: ${e.stack}`);
 ```
 
 ### Validate inputs early — fail fast
