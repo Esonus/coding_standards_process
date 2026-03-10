@@ -458,6 +458,8 @@ Think of it as a funnel — data gets smaller and more processed at each stage:
 
 You don't need to build an array and return it. Just return a **saved search**, **`search.create()` object**, or **SuiteQL query** — the platform handles pagination automatically. Keep it minimal and delegate query construction to a library function.
 
+> **Rule:** Always paginate. Saved searches and SuiteQL both have row limits that silently drop data if you don't paginate. See [Section 16 — Always paginate queries and saved searches](#always-paginate-queries-and-saved-searches) for full patterns.
+
 All search/query logic lives in a **separate lib file** (e.g., `fp_lib_query.js`). The Map/Reduce script just calls the lib.
 
 **Saved Search — platform paginates for you:**
@@ -1779,6 +1781,97 @@ const exemptIds = new Set([101, 202, 303]);
 if (exemptIds.has(customerId)) { }
 ```
 
+### Always paginate queries and saved searches
+
+Never assume your result set is small. Data grows over time, and unpaginated queries silently drop rows or hit governance limits. **Every query and search should be paginated.**
+
+**Saved searches — use `runPaged()`, not `.run().each()`:**
+
+```javascript
+// GOOD: runPaged handles memory and governance automatically
+function processAllCustomers() {
+    const results = [];
+    const customerSearch = search.create({
+        type: search.Type.CUSTOMER,
+        filters: [['custentity_fp_needs_sync', 'is', 'T']],
+        columns: ['internalid', 'companyname', 'email']
+    });
+
+    const pagedData = customerSearch.runPaged({ pageSize: 1000 });
+
+    pagedData.pageRanges.forEach(function(pageRange) {
+        pagedData.fetch({ index: pageRange.index }).data.forEach(function(result) {
+            results.push({
+                id:    result.getValue('internalid'),
+                name:  result.getValue('companyname'),
+                email: result.getValue('email')
+            });
+        });
+    });
+
+    return results;
+}
+```
+
+```javascript
+// BAD: .run().each() stops at 4000 results with no warning
+customerSearch.run().each(function(result) {
+    results.push(result);
+    return true;  // Silently misses rows beyond 4000
+});
+```
+
+**SuiteQL — always use `OFFSET` / `FETCH FIRST N ROWS ONLY`:**
+
+```javascript
+// GOOD: Paginated SuiteQL — gets every row
+function getAllPendingTransactions() {
+    const PAGE_SIZE = 1000;
+    let offset = 0;
+    const allResults = [];
+    let hasMore = true;
+
+    while (hasMore) {
+        const results = query.runSuiteQL({
+            query: `
+                SELECT id, tranid, type
+                FROM transaction
+                WHERE custbody_fp_needs_processing = 'T'
+                ORDER BY id
+                OFFSET ${offset} ROWS
+                FETCH FIRST ${PAGE_SIZE} ROWS ONLY
+            `
+        }).asMappedResults();
+
+        allResults.push(...results);
+        hasMore = results.length === PAGE_SIZE;
+        offset += PAGE_SIZE;
+    }
+
+    return allResults;
+}
+```
+
+```javascript
+// BAD: No pagination — only gets first page (~5000 rows)
+const results = query.runSuiteQL({
+    query: `SELECT id FROM transaction WHERE type = 'SalesOrd'`
+}).asMappedResults();
+
+// BAD: Using LIMIT (not supported in SuiteQL)
+query.runSuiteQL({
+    query: `SELECT id FROM transaction LIMIT 100`  // ERROR — use FETCH FIRST instead
+});
+```
+
+> **Key points:**
+> - `runPaged()` is the correct API for saved searches — it handles memory and respects governance.
+> - `.run().each()` caps at 4,000 results and gives no warning when rows are dropped.
+> - SuiteQL does **not** auto-paginate. You must loop with `OFFSET` and `FETCH FIRST N ROWS ONLY`.
+> - `LIMIT` is **not supported** in SuiteQL — always use `FETCH FIRST N ROWS ONLY`.
+> - Always include `ORDER BY` when paginating to guarantee consistent row ordering across pages.
+> - See also: [Section 4 — getInputData](#getinputdata--return-a-search-or-query-dont-return-data) for Map/Reduce-specific pagination patterns.
+
 ### Don't fetch more data than you need
 
 ```javascript
@@ -1823,6 +1916,7 @@ Use this before submitting code for review:
 - [ ] Error handling at entry points with context in log messages
 - [ ] No secrets in code or logs
 - [ ] Input validated at system boundaries
+- [ ] All queries and saved searches are paginated
 
 ### Before committing
 - [ ] Tests written for new/changed logic
