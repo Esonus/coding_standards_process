@@ -852,8 +852,16 @@ function beforeSubmit(context) {
         validateTransaction(context.newRecord);
         calculateTax(context.newRecord);
     } catch (e) {
-        logError('beforeSubmit', e);
-        throw e;  // Re-throw so the platform knows it failed
+        // Log the FULL error with stack trace — this goes to the Execution Log
+        log.error('beforeSubmit', `${e.message}\nStack: ${e.stack || 'No stack trace'}`);
+
+        // Throw a CLEAN, user-friendly message — this is what the user sees on screen
+        // Never throw the raw error — the user gets an ugly stack dump page
+        throw error.create({
+            name: 'FP_TAX_CALC_ERROR',
+            message: 'Tax calculation failed. Please contact support. Details logged.',
+            notifyOff: false
+        });
     }
 }
 
@@ -861,9 +869,26 @@ function afterSubmit(context) {
     try {
         postToExternalApi(context.newRecord);
     } catch (e) {
-        logError('afterSubmit', e);
-        // Don't re-throw in afterSubmit — transaction is already saved
+        // afterSubmit: transaction is already saved — log but don't throw
+        log.error('afterSubmit', `${e.message}\nStack: ${e.stack || 'No stack trace'}`);
     }
+}
+```
+
+```javascript
+// BAD: Raw throw — user sees ugly error page with stack dump
+try {
+    calculateTax(context.newRecord);
+} catch (e) {
+    throw e;  // User sees: "TypeError: Cannot read property 'taxcode' of undefined"
+}
+
+// BAD: Throw without logging stack trace — impossible to debug
+try {
+    calculateTax(context.newRecord);
+} catch (e) {
+    log.error('beforeSubmit', e.message);  // No stack trace logged!
+    throw error.create({ name: 'ERROR', message: 'Something failed' });
 }
 ```
 
@@ -888,12 +913,12 @@ try {
 ```
 
 ```javascript
-// GOOD: Always log or handle
+// GOOD: Always log with stack trace
 try {
     processLine(record, i);
 } catch (e) {
-    logError('processLine', e);
-    throw e;
+    log.error('processLine', `${e.message}\nStack: ${e.stack || 'No stack trace'}`);
+    throw e;  // OK to re-throw raw here — this is a helper, not an entry point
 }
 
 // GOOD: If you genuinely want to continue, log WHY you're ignoring it
@@ -969,9 +994,15 @@ function beforeSubmit(context) {
     try {
         calculateTax(context.newRecord);
     } catch (e) {
-        // Error message: "Line 3 "Widget-A" (taxcode: AVATAX): Connection timeout"
-        logError('beforeSubmit', e);
-        throw e;
+        // Log the full error with stack — "Line 3 "Widget-A" (taxcode: AVATAX): Connection timeout"
+        log.error('beforeSubmit', `${e.message}\nStack: ${e.stack || 'No stack trace'}`);
+
+        // Throw clean message for the user
+        throw error.create({
+            name: 'FP_TAX_CALC_ERROR',
+            message: 'Tax calculation failed. Please contact support. Details logged.',
+            notifyOff: false
+        });
     }
 }
 ```
@@ -985,15 +1016,29 @@ Not just:
 [ERROR] Connection timeout
 ```
 
-### Use a consistent `logError` helper
+### Use a consistent `logError` helper — always include stack trace
+
+The stack trace is the most important debugging tool you have. **Never log an error without it.** Without a stack trace, all you get is a message like "Cannot read property 'x' of undefined" with no idea which file or line caused it.
 
 ```javascript
-function logError(context, error) {
+function logError(context, err) {
     log.error(context, [
-        `Message: ${error.message || 'Unknown error'}`,
-        `Stack: ${error.stack || 'No stack trace'}`
+        `Message: ${err.message || 'Unknown error'}`,
+        `Name: ${err.name || 'Error'}`,
+        `Stack: ${err.stack || 'No stack trace available'}`
     ].join('\n'));
 }
+```
+
+```javascript
+// BAD: No stack trace — you'll never find the source
+log.error('beforeSubmit', e.message);
+
+// BAD: Just the error object — NetSuite may serialize it poorly
+log.error('beforeSubmit', e);
+
+// GOOD: Explicit stack trace in the log
+log.error('beforeSubmit', `${e.message}\nStack: ${e.stack}`);
 ```
 
 ### Validate inputs early — fail fast
