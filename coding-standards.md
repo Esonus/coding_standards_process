@@ -277,6 +277,55 @@ define(['N/record'], function(record) {
 });
 ```
 
+### Declare the return value at the top of the function
+
+Establish what you're going to return at the **beginning** of the function. This makes the function's intent clear from line one — anyone reading it immediately knows what's being built. Build it up through the function, then return it at the end.
+
+```javascript
+// GOOD: Return value declared upfront — intent is clear
+function buildTaxPayload(record) {
+    const payload = {
+        transactionId: record.id,
+        lines: [],
+        totalAmount: 0
+    };
+
+    const lineCount = record.getLineCount({ sublistId: 'item' });
+    for (let i = 0; i < lineCount; i++) {
+        const lineData = getLineData(record, i);
+        payload.lines.push(lineData);
+        payload.totalAmount += lineData.amount;
+    }
+
+    return payload;
+}
+```
+
+```javascript
+// GOOD: Even simple functions — declare what you return
+function getTransactionIds(filters) {
+    const ids = [];
+
+    const results = search.create({ /* ... */ }).run();
+    results.each(function(result) {
+        ids.push(result.getValue('internalid'));
+        return true;
+    });
+
+    return ids;
+}
+```
+
+```javascript
+// BAD: Return value appears out of nowhere at the end
+function buildTaxPayload(record) {
+    const lineCount = record.getLineCount({ sublistId: 'item' });
+    // ... 40 lines of processing ...
+    // ... more processing ...
+    return { transactionId: record.id, lines: processedLines, totalAmount: sum };  // Surprise!
+}
+```
+
 ### Keep functions small — aim for under 30 lines
 
 If a function is getting long, break it into helpers. Each function should do **one thing**.
@@ -391,46 +440,127 @@ Think of it as a funnel — data gets smaller and more processed at each stage:
 
 | Stage | Purpose | Input | Output |
 |-------|---------|-------|--------|
-| `getInputData` | Fetch the full data set | Parameters/searches | Array or search object |
+| `getInputData` | Set up the search or query | Parameters/config | Search object, SuiteQL query, or API call |
 | `map` | Break down, validate, group | One item from input | `context.write({ key, value })` grouped by key |
 | `reduce` | Create/update/delete records | Grouped values per key | `context.write({ key, value })` result per key |
 | `summarize` | Report totals, log errors | All output + error iterators | Final log entry |
 
-### `getInputData` — just call to get data
+### `getInputData` — return a search or query, don't return data
 
-Keep `getInputData` minimal. Delegate to a library function — don't build searches or apply filters inline. All query logic belongs in a lib module so it's testable and reusable.
+You don't need to build an array and return it. Just return a **saved search**, **`search.create()` object**, or **SuiteQL query** — the platform handles pagination automatically. Keep it minimal and delegate query construction to a library function.
+
+All search/query logic lives in a **separate lib file** (e.g., `fp_lib_query.js`). The Map/Reduce script just calls the lib.
+
+**Saved Search — platform paginates for you:**
 
 ```javascript
-// GOOD: One-liner — delegate to a library
+// ── fp_mr_batch_processor.js ──────────────────────────────
+// getInputData just calls the lib — no search logic here
+function getInputData() {
+    return fp_lib_query.createTransactionSearch();
+}
+```
+
+```javascript
+// ── fp_lib_query.js ───────────────────────────────────────
+// Search construction lives here — testable, reusable
+function createTransactionSearch() {
+    return search.create({
+        type: search.Type.TRANSACTION,
+        filters: [
+            ['type', 'anyof', 'SalesOrd', 'CustInvc'],
+            'AND', ['mainline', 'is', 'T'],
+            'AND', ['custbody_fp_needs_processing', 'is', 'T']
+        ],
+        columns: ['internalid', 'type', 'tranid', 'entity']
+    });
+    // Return the search object — DON'T .run().each() it
+    // NetSuite's Map/Reduce engine iterates the search automatically
+}
+```
+
+**SuiteQL with pagination (`OFFSET`/`FETCH`):**
+
+When using SuiteQL, the platform does **not** auto-paginate. The lib handles paging with `OFFSET` and `FETCH FIRST N ROWS ONLY`:
+
+```javascript
+// ── fp_mr_sync_records.js ─────────────────────────────────
+function getInputData() {
+    return fp_lib_query.getAllTransactionIds();
+}
+```
+
+```javascript
+// ── fp_lib_query.js ───────────────────────────────────────
+function getAllTransactionIds() {
+    const PAGE_SIZE = 1000;
+    let offset = 0;
+    const allResults = [];
+    let hasMore = true;
+
+    while (hasMore) {
+        const results = query.runSuiteQL({
+            query: `
+                SELECT id, type, tranid
+                FROM transaction
+                WHERE custbody_fp_needs_processing = 'T'
+                  AND type IN ('SalesOrd', 'CustInvc')
+                ORDER BY id
+                OFFSET ${offset} ROWS
+                FETCH FIRST ${PAGE_SIZE} ROWS ONLY
+            `
+        }).asMappedResults();
+
+        allResults.push(...results);
+        hasMore = results.length === PAGE_SIZE;
+        offset += PAGE_SIZE;
+    }
+
+    return allResults;
+}
+```
+
+**External API call — also in a lib:**
+
+```javascript
+// ── fp_mr_upsert_tax_codes.js ─────────────────────────────
 function getInputData() {
     return fp_lib_api_connect.getTaxCodes();
 }
 ```
 
 ```javascript
-// GOOD: Delegate with parameters from script deployment
-function getInputData() {
-    const script = runtime.getCurrentScript();
-    return fp_lib_query.getTransactionIds({
-        filterType: script.getParameter({ name: 'custscript_fp_batch_type' }),
-        limit: parseInt(script.getParameter({ name: 'custscript_fp_batch_limit' }), 10) || 500
-    });
+// ── fp_lib_api_connect.js ─────────────────────────────────
+function getTaxCodes() {
+    const response = https.post({ url: endpoint, headers: authHeaders, body: payload });
+    return JSON.parse(response.body);
 }
 ```
 
+**What NOT to do:**
+
 ```javascript
-// BAD: Inline search/query logic — move this to a lib module
+// BAD: Search logic inline in the Map/Reduce script — move to a lib file
 function getInputData() {
     const results = [];
     search.create({
         type: 'transaction',
-        filters: [['type', 'anyof', 'SalesOrd'], 'AND', ['status', 'is', 'open']],
-        columns: ['internalid', 'tranid', 'entity']
+        filters: [['type', 'anyof', 'SalesOrd']],
+        columns: ['internalid', 'tranid']
     }).run().each(function(result) {
-        results.push(result);
+        results.push(result);  // Building array manually — unnecessary
         return true;
     });
-    return results;
+    return results;  // Just return the search object instead
+}
+```
+
+```javascript
+// BAD: SuiteQL without pagination — misses rows beyond first page
+function getInputData() {
+    return query.runSuiteQL({
+        query: `SELECT id FROM transaction WHERE type = 'SalesOrd'`
+    }).asMappedResults();  // Only gets first 5000 rows!
 }
 ```
 
