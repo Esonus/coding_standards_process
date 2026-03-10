@@ -164,6 +164,15 @@ for (var i = 0; i < 5; i++) { }
 console.log(i);  // 5 — still accessible! With let, this would throw ReferenceError
 ```
 
+### Write plain JavaScript — no TypeScript unless approved
+
+All SuiteScript code is written in **plain JavaScript (ES6/ES2015+)**. Do not use TypeScript. The transpilation step from TS → JS introduces compatibility risks with the SuiteScript runtime, and most dev teams are not experienced with TypeScript. Only use TypeScript if explicitly approved by the dev manager (directive may come from the client or implementation partner).
+
+```
+GOOD:  fp_lib_settings.js      ← Plain JavaScript, runs directly on the platform
+BAD:   fp_lib_settings.ts      ← Requires transpilation, risk of runtime issues
+```
+
 ### Use platform enums — never hardcode string/number literals
 
 When the platform provides enums or constants, always use them instead of raw strings or numbers. This prevents typos, enables IDE autocomplete, and survives platform changes.
