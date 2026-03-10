@@ -454,15 +454,15 @@ Think of it as a funnel — data gets smaller and more processed at each stage:
 | `reduce` | Create/update/delete records | Grouped values per key | `context.write({ key, value })` result per key |
 | `summarize` | Report totals, log errors | All output + error iterators | Final log entry |
 
-### `getInputData` — return a search or query, don't return data
+### `getInputData` — return a search object, let the platform paginate
 
-You don't need to build an array and return it. Just return a **saved search**, **`search.create()` object**, or **SuiteQL query** — the platform handles pagination automatically. Keep it minimal and delegate query construction to a library function.
-
-> **Rule:** Always paginate. Saved searches and SuiteQL both have row limits that silently drop data if you don't paginate. See [Section 16 — Always paginate queries and saved searches](#always-paginate-queries-and-saved-searches) for full patterns.
+**Never build an array in `getInputData`.** Return a **search object** or a **SuiteQL query structure** — the Map/Reduce engine iterates and paginates it automatically. You don't call `.run()`, you don't call `.each()`, you don't build arrays. Just return the structure and let the platform do the work.
 
 All search/query logic lives in a **separate lib file** (e.g., `fp_lib_query.js`). The Map/Reduce script just calls the lib.
 
-**Saved Search — platform paginates for you:**
+> **Rule:** `getInputData` sets up *what* to query — it never executes the query or builds results. The platform handles iteration and pagination. For pagination patterns outside of Map/Reduce (Suitelets, user events, standalone libs), see [Section 16 — Always paginate queries and saved searches](#always-paginate-queries-and-saved-searches).
+
+**Saved Search — return the search object:**
 
 ```javascript
 // ── fp_mr_batch_processor.js ──────────────────────────────
@@ -486,52 +486,66 @@ function createTransactionSearch() {
         columns: ['internalid', 'type', 'tranid', 'entity']
     });
     // Return the search object — DON'T .run().each() it
-    // NetSuite's Map/Reduce engine iterates the search automatically
+    // The Map/Reduce engine iterates and paginates automatically
 }
 ```
 
-**SuiteQL with pagination (`OFFSET`/`FETCH`):**
-
-When using SuiteQL, the platform does **not** auto-paginate. The lib handles paging with `OFFSET` and `FETCH FIRST N ROWS ONLY`:
+**SuiteQL — return the query structure, not the results:**
 
 ```javascript
-// ── fp_mr_sync_records.js ─────────────────────────────────
+// ── fp_mr_update_addresses.js ─────────────────────────────
+// getInputData returns a SuiteQL structure — platform paginates
 function getInputData() {
-    return fp_lib_query.getAllTransactionIds();
+    return fp_lib_query.buildAddressQuery(batchSize);
 }
 ```
 
 ```javascript
 // ── fp_lib_query.js ───────────────────────────────────────
-function getAllTransactionIds() {
-    const PAGE_SIZE = 1000;
-    let offset = 0;
-    const allResults = [];
-    let hasMore = true;
-
-    while (hasMore) {
-        const results = query.runSuiteQL({
-            query: `
-                SELECT id, type, tranid
-                FROM transaction
-                WHERE custbody_fp_needs_processing = 'T'
-                  AND type IN ('SalesOrd', 'CustInvc')
-                ORDER BY id
-                OFFSET ${offset} ROWS
-                FETCH FIRST ${PAGE_SIZE} ROWS ONLY
-            `
-        }).asMappedResults();
-
-        allResults.push(...results);
-        hasMore = results.length === PAGE_SIZE;
-        offset += PAGE_SIZE;
-    }
-
-    return allResults;
+// Query construction lives here — testable, reusable
+function buildAddressQuery(batchSize) {
+    return {
+        type: 'suiteql',
+        query: `
+            SELECT TOP ${batchSize} customer.id AS entityid,
+                ShipToAddress.addr1 AS line1,
+                ShipToAddress.city AS city,
+                ShipToAddress.state AS state,
+                ShipToAddress.zip AS zip
+            FROM customer
+                LEFT OUTER JOIN entityaddressbook AS DefaultShipping
+                    ON (DefaultShipping.entity = customer.id)
+                    AND (DefaultShipping.defaultshipping = 'T')
+                LEFT OUTER JOIN entityaddress AS ShipToAddress
+                    ON (ShipToAddress.nkey = DefaultShipping.addressbookaddress)
+            WHERE customer.isinactive = 'F'
+                AND ShipToAddress.addr1 IS NOT NULL
+            ORDER BY customer.id DESC
+        `
+    };
+    // Return { type: 'suiteql', query: '...' } — DON'T call runSuiteQL()
+    // The Map/Reduce engine executes the query and paginates automatically
 }
 ```
 
-**External API call — also in a lib:**
+**Loading a saved search by ID — same pattern:**
+
+```javascript
+// ── fp_mr_sync_records.js ─────────────────────────────────
+function getInputData() {
+    return fp_lib_query.loadPendingTransactionSearch();
+}
+```
+
+```javascript
+// ── fp_lib_query.js ───────────────────────────────────────
+function loadPendingTransactionSearch() {
+    return search.load({ id: 'customsearch_fp_pending_transactions' });
+    // Platform paginates — no .run(), no .each(), no arrays
+}
+```
+
+**External API call — the only case where you return data:**
 
 ```javascript
 // ── fp_mr_upsert_tax_codes.js ─────────────────────────────
@@ -545,13 +559,14 @@ function getInputData() {
 function getTaxCodes() {
     const response = https.post({ url: endpoint, headers: authHeaders, body: payload });
     return JSON.parse(response.body);
+    // External API — no search/query structure available, array is the only option
 }
 ```
 
 **What NOT to do:**
 
 ```javascript
-// BAD: Search logic inline in the Map/Reduce script — move to a lib file
+// BAD: Building an array — just return the search object instead
 function getInputData() {
     const results = [];
     search.create({
@@ -559,19 +574,31 @@ function getInputData() {
         filters: [['type', 'anyof', 'SalesOrd']],
         columns: ['internalid', 'tranid']
     }).run().each(function(result) {
-        results.push(result);  // Building array manually — unnecessary
+        results.push(result);  // Unnecessary — the platform does this for you
         return true;
     });
-    return results;  // Just return the search object instead
+    return results;
 }
 ```
 
 ```javascript
-// BAD: SuiteQL without pagination — misses rows beyond first page
+// BAD: Executing SuiteQL and returning results — return the query structure instead
 function getInputData() {
     return query.runSuiteQL({
         query: `SELECT id FROM transaction WHERE type = 'SalesOrd'`
-    }).asMappedResults();  // Only gets first 5000 rows!
+    }).asMappedResults();  // Executes the query AND builds an array — let the platform do this
+}
+```
+
+```javascript
+// BAD: Inline search/query logic — move it to a lib file
+function getInputData() {
+    return search.create({
+        type: 'transaction',
+        filters: [['type', 'anyof', 'SalesOrd']],
+        columns: ['internalid']
+    });
+    // Search construction belongs in fp_lib_query.js, not in the M/R script
 }
 ```
 
