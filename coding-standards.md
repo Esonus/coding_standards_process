@@ -396,27 +396,41 @@ Think of it as a funnel — data gets smaller and more processed at each stage:
 | `reduce` | Create/update/delete records | Grouped values per key | `context.write({ key, value })` result per key |
 | `summarize` | Report totals, log errors | All output + error iterators | Final log entry |
 
-### `getInputData` — fetch the work set
+### `getInputData` — just call to get data
 
-Return an array of IDs or a search object. Apply limits for safety.
+Keep `getInputData` minimal. Delegate to a library function — don't build searches or apply filters inline. All query logic belongs in a lib module so it's testable and reusable.
 
 ```javascript
+// GOOD: One-liner — delegate to a library
 function getInputData() {
-    try {
-        const script = runtime.getCurrentScript();
-        const limit = parseInt(script.getParameter({ name: 'custscript_fp_batch_limit' }), 10) || DEFAULT_LIMIT;
+    return fp_lib_api_connect.getTaxCodes();
+}
+```
 
-        let transactionIds = txnQuery.getTransactionIds({ filterType });
+```javascript
+// GOOD: Delegate with parameters from script deployment
+function getInputData() {
+    const script = runtime.getCurrentScript();
+    return fp_lib_query.getTransactionIds({
+        filterType: script.getParameter({ name: 'custscript_fp_batch_type' }),
+        limit: parseInt(script.getParameter({ name: 'custscript_fp_batch_limit' }), 10) || 500
+    });
+}
+```
 
-        if (limit > 0 && transactionIds.length > limit) {
-            transactionIds = transactionIds.slice(0, limit);
-        }
-
-        return transactionIds;
-    } catch (e) {
-        logError('getInputData', e);
-        return [];  // Return empty — don't crash the job
-    }
+```javascript
+// BAD: Inline search/query logic — move this to a lib module
+function getInputData() {
+    const results = [];
+    search.create({
+        type: 'transaction',
+        filters: [['type', 'anyof', 'SalesOrd'], 'AND', ['status', 'is', 'open']],
+        columns: ['internalid', 'tranid', 'entity']
+    }).run().each(function(result) {
+        results.push(result);
+        return true;
+    });
+    return results;
 }
 ```
 
