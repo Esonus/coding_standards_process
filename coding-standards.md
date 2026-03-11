@@ -865,6 +865,72 @@ return { post, get: get };
 - Building API endpoints for third-party integrations
 - Automated testing (Playwright E2E tests use REST to create test data)
 
+### Avoid `record.load` / `record.save` — use lightweight APIs instead
+
+`record.load()` and `record.save()` are the most expensive operations in SuiteScript — they consume heavy governance, trigger workflows/user events, and lock the record. **Use them only when you have no alternative** (e.g., subrecords that must be read or modified).
+
+For everything else, use the lightweight alternatives:
+
+| Need | Use | Instead of |
+|------|-----|------------|
+| Read a few fields | `search.lookupFields()` | `record.load()` + `getValue()` |
+| Read many fields/lines | SuiteQL via `query.runSuiteQL()` | `record.load()` + loop |
+| Update a few fields | `record.submitFields()` | `record.load()` + `setValue()` + `save()` |
+
+```javascript
+// GOOD: Read fields without loading the record (2 governance units)
+const fields = search.lookupFields({
+    type: search.Type.SALES_ORDER,
+    id: transactionId,
+    columns: ['tranid', 'status', 'entity', 'custbody_fp_tax_history_steps']
+});
+const status = fields.status[0].value;
+const tranId = fields.tranid;
+```
+
+```javascript
+// GOOD: Update fields without loading the record (2 governance units)
+record.submitFields({
+    type: record.Type.SALES_ORDER,
+    id: transactionId,
+    values: {
+        custbody_fp_tax_history_steps: JSON.stringify(taxSteps),
+        custbody_fp_last_calc_date: new Date()
+    },
+    options: { enableSourcing: false, ignoreMandatoryFields: true }
+});
+```
+
+```javascript
+// GOOD: Read line-level data via SuiteQL (1 governance unit)
+const lines = query.runSuiteQL({
+    query: `
+        SELECT line, item, taxcode, amount
+        FROM transactionline
+        WHERE transaction = ${transactionId}
+            AND taxline = 'F' AND mainline = 'F'
+        ORDER BY line
+    `
+}).asMappedResults();
+```
+
+```javascript
+// BAD: Loading the full record just to read or update a few fields (10 governance units)
+const rec = record.load({ type: record.Type.SALES_ORDER, id: transactionId });
+const status = rec.getValue('status');
+rec.setValue({ fieldId: 'custbody_fp_notes', value: 'Updated' });
+rec.save();
+```
+
+**This is especially important in `afterSubmit`**, where the transaction is already saved. In most cases you only need to read values or update a few fields — `search.lookupFields()`, SuiteQL, and `record.submitFields()` handle this without the overhead of a full load/save cycle.
+
+**When you DO need `record.load`:**
+- Reading or modifying **subrecords** (addresses, inventory detail) — subrecords require a loaded parent record
+- Setting **sublist values** that can't be done via `submitFields` (e.g., line-level fields on item sublists)
+- Dynamic mode operations where you need field sourcing to fire (e.g., setting `entity` and waiting for address fields to populate)
+
+> **Rule:** Default to `search.lookupFields` / `record.submitFields` / SuiteQL. Only use `record.load` + `record.save` when subrecords or sublist modifications require it. When you do load a record, document **why** a lightweight API wasn't sufficient.
+
 ---
 
 ## 6. Error Handling
@@ -1393,6 +1459,44 @@ const name = input.name ?? 'Unknown';  // '' (empty string) is a valid name
 const count = input.count || 10;       // If count is 0, you get 10!
 const name = input.name || 'Unknown';  // If name is '', you get 'Unknown'!
 ```
+
+### Use template literals — never string concatenation
+
+Always use template literals (backticks) for strings. Never use `+` to concatenate strings — it's harder to read, easier to mess up spacing, and doesn't handle multi-line strings cleanly.
+
+```javascript
+// GOOD: Template literals — clear and readable
+const message = `Order #${orderId} created for ${customerName}`;
+const url = `${baseUrl}/api/v1/transactions/${txnId}`;
+log.debug('processLine', `Line ${i}: item ${itemName}, amount ${amount}`);
+
+const html = `
+    <div class="container">
+        <h1>${title}</h1>
+        <p>${description}</p>
+    </div>
+`;
+```
+
+```javascript
+// BAD: String concatenation — messy and error-prone
+const message = 'Order #' + orderId + ' created for ' + customerName;
+const url = baseUrl + '/api/v1/transactions/' + txnId;
+log.debug('processLine', 'Line ' + i + ': item ' + itemName + ', amount ' + amount);
+```
+
+Use template literals even for simple strings with no interpolation — it keeps the codebase consistent and makes it easy to add variables later:
+
+```javascript
+// GOOD: Consistent backticks everywhere
+const label = `Tax Calculation`;
+const endpoint = `/api/tax/calculate`;
+
+// ACCEPTABLE but not preferred: Single quotes for simple strings with no interpolation
+const label = 'Tax Calculation';
+```
+
+> **Rule:** If a string contains variables, expressions, or spans multiple lines, it **must** be a template literal. For plain strings, template literals are preferred but single quotes are acceptable. Never use double quotes — single quotes or backticks only.
 
 ### Normalize data at the boundary, use it clean internally
 
@@ -1938,11 +2042,13 @@ Use this before submitting code for review:
 ### While writing code
 - [ ] Functions are under 30 lines
 - [ ] No magic numbers or strings — all named constants
+- [ ] Template literals for all strings with variables — no `+` concatenation
 - [ ] Variables and functions have descriptive names
 - [ ] Booleans prefixed with `is`/`has`/`should`/`can`
 - [ ] Error handling at entry points with context in log messages
 - [ ] No secrets in code or logs
 - [ ] Input validated at system boundaries
+- [ ] Using `lookupFields`/`submitFields`/SuiteQL instead of `record.load`/`save` where possible
 - [ ] All queries and saved searches are paginated
 
 ### Before committing
