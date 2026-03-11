@@ -1394,6 +1394,44 @@ const count = input.count || 10;       // If count is 0, you get 10!
 const name = input.name || 'Unknown';  // If name is '', you get 'Unknown'!
 ```
 
+### Use template literals — never string concatenation
+
+Always use template literals (backticks) for strings. Never use `+` to concatenate strings — it's harder to read, easier to mess up spacing, and doesn't handle multi-line strings cleanly.
+
+```javascript
+// GOOD: Template literals — clear and readable
+const message = `Order #${orderId} created for ${customerName}`;
+const url = `${baseUrl}/api/v1/transactions/${txnId}`;
+log.debug('processLine', `Line ${i}: item ${itemName}, amount ${amount}`);
+
+const html = `
+    <div class="container">
+        <h1>${title}</h1>
+        <p>${description}</p>
+    </div>
+`;
+```
+
+```javascript
+// BAD: String concatenation — messy and error-prone
+const message = 'Order #' + orderId + ' created for ' + customerName;
+const url = baseUrl + '/api/v1/transactions/' + txnId;
+log.debug('processLine', 'Line ' + i + ': item ' + itemName + ', amount ' + amount);
+```
+
+Use template literals even for simple strings with no interpolation — it keeps the codebase consistent and makes it easy to add variables later:
+
+```javascript
+// GOOD: Consistent backticks everywhere
+const label = `Tax Calculation`;
+const endpoint = `/api/tax/calculate`;
+
+// ACCEPTABLE but not preferred: Single quotes for simple strings with no interpolation
+const label = 'Tax Calculation';
+```
+
+> **Rule:** If a string contains variables, expressions, or spans multiple lines, it **must** be a template literal. For plain strings, template literals are preferred but single quotes are acceptable. Never use double quotes — single quotes or backticks only.
+
 ### Normalize data at the boundary, use it clean internally
 
 ```javascript
@@ -1938,6 +1976,7 @@ Use this before submitting code for review:
 ### While writing code
 - [ ] Functions are under 30 lines
 - [ ] No magic numbers or strings — all named constants
+- [ ] Template literals for all strings with variables — no `+` concatenation
 - [ ] Variables and functions have descriptive names
 - [ ] Booleans prefixed with `is`/`has`/`should`/`can`
 - [ ] Error handling at entry points with context in log messages
