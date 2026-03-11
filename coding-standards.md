@@ -865,6 +865,72 @@ return { post, get: get };
 - Building API endpoints for third-party integrations
 - Automated testing (Playwright E2E tests use REST to create test data)
 
+### Avoid `record.load` / `record.save` — use lightweight APIs instead
+
+`record.load()` and `record.save()` are the most expensive operations in SuiteScript — they consume heavy governance, trigger workflows/user events, and lock the record. **Use them only when you have no alternative** (e.g., subrecords that must be read or modified).
+
+For everything else, use the lightweight alternatives:
+
+| Need | Use | Instead of |
+|------|-----|------------|
+| Read a few fields | `search.lookupFields()` | `record.load()` + `getValue()` |
+| Read many fields/lines | SuiteQL via `query.runSuiteQL()` | `record.load()` + loop |
+| Update a few fields | `record.submitFields()` | `record.load()` + `setValue()` + `save()` |
+
+```javascript
+// GOOD: Read fields without loading the record (2 governance units)
+const fields = search.lookupFields({
+    type: search.Type.SALES_ORDER,
+    id: transactionId,
+    columns: ['tranid', 'status', 'entity', 'custbody_fp_tax_history_steps']
+});
+const status = fields.status[0].value;
+const tranId = fields.tranid;
+```
+
+```javascript
+// GOOD: Update fields without loading the record (2 governance units)
+record.submitFields({
+    type: record.Type.SALES_ORDER,
+    id: transactionId,
+    values: {
+        custbody_fp_tax_history_steps: JSON.stringify(taxSteps),
+        custbody_fp_last_calc_date: new Date()
+    },
+    options: { enableSourcing: false, ignoreMandatoryFields: true }
+});
+```
+
+```javascript
+// GOOD: Read line-level data via SuiteQL (1 governance unit)
+const lines = query.runSuiteQL({
+    query: `
+        SELECT line, item, taxcode, amount
+        FROM transactionline
+        WHERE transaction = ${transactionId}
+            AND taxline = 'F' AND mainline = 'F'
+        ORDER BY line
+    `
+}).asMappedResults();
+```
+
+```javascript
+// BAD: Loading the full record just to read or update a few fields (10 governance units)
+const rec = record.load({ type: record.Type.SALES_ORDER, id: transactionId });
+const status = rec.getValue('status');
+rec.setValue({ fieldId: 'custbody_fp_notes', value: 'Updated' });
+rec.save();
+```
+
+**This is especially important in `afterSubmit`**, where the transaction is already saved. In most cases you only need to read values or update a few fields — `search.lookupFields()`, SuiteQL, and `record.submitFields()` handle this without the overhead of a full load/save cycle.
+
+**When you DO need `record.load`:**
+- Reading or modifying **subrecords** (addresses, inventory detail) — subrecords require a loaded parent record
+- Setting **sublist values** that can't be done via `submitFields` (e.g., line-level fields on item sublists)
+- Dynamic mode operations where you need field sourcing to fire (e.g., setting `entity` and waiting for address fields to populate)
+
+> **Rule:** Default to `search.lookupFields` / `record.submitFields` / SuiteQL. Only use `record.load` + `record.save` when subrecords or sublist modifications require it. When you do load a record, document **why** a lightweight API wasn't sufficient.
+
 ---
 
 ## 6. Error Handling
@@ -1982,6 +2048,7 @@ Use this before submitting code for review:
 - [ ] Error handling at entry points with context in log messages
 - [ ] No secrets in code or logs
 - [ ] Input validated at system boundaries
+- [ ] Using `lookupFields`/`submitFields`/SuiteQL instead of `record.load`/`save` where possible
 - [ ] All queries and saved searches are paginated
 
 ### Before committing
