@@ -205,10 +205,46 @@ function calculateTax(amount, rate) { }
 
 ### Constants — `UPPER_SNAKE_CASE`
 
+Reserve `UPPER_SNAKE_CASE` for **top-level** constant declarations — simple scalar values or frozen enum-style maps whose keys represent distinct named values (like statuses or record types).
+
 ```javascript
 const MAX_RETRIES = 3;
 const CACHE_TTL = 60 * 60;  // 1 hour in seconds
 const API_BASE_URL = 'https://api.example.com';
+```
+
+For **constant objects that group related configuration or field mappings**, use `UPPER_SNAKE_CASE` for the top-level declaration but `camelCase` for nested structural keys. This distinguishes the constant itself from its internal properties.
+
+```javascript
+// GOOD: top-level const is UPPER_SNAKE, nested keys are camelCase
+const ENVELOPE_STATUS = Object.freeze({
+    recordType: 'customrecord_docusign_envelope_status_cr',
+    fields: Object.freeze({
+        documentName:   'custrecord_ds_document_name_cf',
+        documentSaved:  'custrecord_ds_document_saved_cf',
+        netsuiteRecId:  'custrecord_ds_record_id_cf'
+    })
+});
+
+// BAD: all-caps nested keys — reads like every property is a standalone constant
+const ENVELOPE_STATUS = {
+    RECORD_TYPE: 'customrecord_docusign_envelope_status_cr',
+    FIELDS: {
+        DOCUMENT_NAME: 'custrecord_ds_document_name_cf'
+    }
+};
+```
+
+**Exception:** Flat enum-style maps where every key *is* a named constant value keep `UPPER_SNAKE_CASE` throughout:
+
+```javascript
+// GOOD: flat enum — each key is a distinct named value
+const ORDER_STATUS = Object.freeze({
+    PENDING:   'pending',
+    APPROVED:  'approved',
+    SHIPPED:   'shipped',
+    CANCELLED: 'cancelled'
+});
 ```
 
 ### Booleans — prefix with `is`, `has`, `should`, `can`
@@ -1402,32 +1438,41 @@ setTimeout(fn, ONE_HOUR_MS);
 
 ### Use `Object.freeze()` for constant maps
 
+Always freeze constant objects to prevent accidental mutation. Use `UPPER_SNAKE_CASE` keys for flat enum-style maps, `camelCase` for structured config (see [Naming — Constants](#constants--upper_snake_case)).
+
 ```javascript
+// Flat enum — UPPER_SNAKE_CASE keys
 const ORDER_STATUS = Object.freeze({
-    PENDING: 'pending',
-    APPROVED: 'approved',
-    SHIPPED: 'shipped',
+    PENDING:   'pending',
+    APPROVED:  'approved',
+    SHIPPED:   'shipped',
     CANCELLED: 'cancelled'
 });
 
-// Prevents accidental mutation
 ORDER_STATUS.PENDING = 'oops';  // Silently fails (or throws in strict mode)
+
+// Structured config with nested objects — camelCase keys
+const ESTIMATE = Object.freeze({
+    fields: Object.freeze({
+        docusignSignedDoc: 'custbody_ft_docusign_signed_doc'
+    })
+});
 ```
 
 ### Group related config together
 
 ```javascript
-const CACHE_CONFIG = {
+const CACHE_CONFIG = Object.freeze({
     name: 'app_settings',
     ttl: 60 * 60,        // 1 hour
     scope: 'protected'
-};
+});
 
-const API_CONFIG = {
+const API_CONFIG = Object.freeze({
     baseUrl: 'https://api.example.com',
     timeout: 30000,       // 30 seconds
     maxRetries: 2
-};
+});
 ```
 
 ---
